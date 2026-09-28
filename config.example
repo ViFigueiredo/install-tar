@@ -1,0 +1,8 @@
+# Arquivo de configuração do install-tar
+# Editado pela GUI (botão Configurações) ou manualmente.
+# Valores possíveis:
+#   PREFIX       diretório de instalação (default: ~/.local)
+#   JOBS         compilação paralela (default: nº de núcleos)
+#   CLEANUP      1=remove temporários, 0=mantém
+#   UPDATE_MENU  1=atualiza menu de apps, 0=não
+#   DOWNLOAD_DIR pasta onde o seletor de arquivo abre (default: ~/Downloads)

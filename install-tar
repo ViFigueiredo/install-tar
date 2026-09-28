@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# install-tar: detect build system inside a .tar.gz and install to user prefix.
+# All settings configurable via ~/.config/install-tar/config (or GUI).
+
+set -euo pipefail
+
+# ---- config file ----
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/install-tar"
+CONFIG_FILE="$CONFIG_DIR/config"
+
+[ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+
+PREFIX="${PREFIX:-$HOME/.local}"
+JOBS="${JOBS:-$(nproc 2>/dev/null || echo 2)}"
+CLEANUP="${CLEANUP:-1}"
+UPDATE_MENU="${UPDATE_MENU:-1}"
+DOWNLOAD_DIR="${DOWNLOAD_DIR:-$HOME/Downloads}"
+
+# ---- helpers ----
+die() { echo "ERRO: $*" >&2; exit 1; }
+have() { [ -e "$1" ]; }
+
+# ---- fetch / extract ----
+fetch_and_extract() {
+  local src="$1" work
+  work="$(mktemp -d /tmp/install-tar.XXXXXX)"
+  case "$src" in
+    http://*|https://*)
+      echo "== baixando $src"
+      curl -fsSL "$src" -o "$work/dl"
+      archive="$work/dl" ;;
+    *)
+      [ -f "$src" ] || die "arquivo nao encontrado: $src"
+      archive="$src" ;;
+  esac
+  case "$archive" in
+    *.tar.gz|*.tgz)  tar -xzf "$archive" -C "$work" ;;
+    *.tar.bz2|*.tbz2) tar -xjf "$archive" -C "$work" ;;
+    *.tar.xz|*.txz)  tar -xJf "$archive" -C "$work" ;;
+    *.tar)           tar -xf  "$archive" -C "$work" ;;
+    *.zip)           (cd "$work" && unzip -q "$archive") ;;
+    *) die "extensao de archive desconhecida: $archive" ;;
+  esac
+  # descend into single-child dirs (foo-1.0/, bad/foo-1.0/, ...)
+  local top cur="$work"
+  while :; do
+    top="$(find "$cur" -mindepth 1 -maxdepth 1 -type d | head -1)"
+    [ -z "$top" ] && break
+    [ "$(find "$cur" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1 ] || break
+    cur="$top"
+  done
+  echo "$cur" > "$work/.srcdir"
+  echo "$work"
+}
+
+# ---- install hooks ----
+try_cargo() {
+  have Cargo.toml || return 1
+  echo "== sistema: cargo (rust)"
+  command -v cargo >/dev/null || die "cargo nao instalado"
+  cargo build --release -j"$JOBS" || return 1
+  local bins
+  bins="$(cargo metadata --no-deps --format-version 1 2>/dev/null | \
+    python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(t["name"] for p in d["targets"] if p["target_type"] and "bin" in p["target_type"]))' 2>/dev/null || true)"
+  [ -n "$bins" ] || bins="$(find target/release -maxdepth 1 -type f -perm -u+x ! -name '*.d' -printf '%f\n' 2>/dev/null | tr '\n' ' ')"
+  [ -n "$bins" ] || return 1
+  for b in $bins; do cp -f "target/release/$b" "$PREFIX/bin/"; echo "   -> $PREFIX/bin/$b"; done
+  return 0
+}
+
+try_go() {
+  have go.mod || return 1
+  echo "== sistema: go"
+  command -v go >/dev/null || die "go nao instalado"
+  if go build -o "$PREFIX/bin/" . 2>/dev/null; then
+    mod="$(awk '/^module/{print $2; exit}' go.mod)"
+    echo "   -> $PREFIX/bin/ (mod: $mod)"; return 0
+  fi
+  go build -o "$PREFIX/bin/" ./... || return 1
+  echo "   -> $PREFIX/bin/ $(ls "$PREFIX/bin/" | tail -1)"
+  return 0
+}
+
+try_python() {
+  have pyproject.toml || have setup.py || have setup.cfg || return 1
+  echo "== sistema: python"
+  if command -v pipx >/dev/null; then
+    pipx install -f . || return 1; echo "   -> pipx"; return 0
+  fi
+  PIP="$(command -v pip3 || command -v pip)" || die "pip nao encontrado"
+  "$PIP" install -f --prefix "$PREFIX" . 2>/dev/null || "$PIP" install -f . || return 1
+  echo "   -> pip"; return 0
+}
+
+try_meson() {
+  have meson.build || return 1
+  echo "== sistema: meson"
+  command -v meson >/dev/null || die "meson nao instalado"
+  meson setup build --prefix="$PREFIX" --libdir=lib || return 1
+  meson compile -C build -j"$JOBS" || return 1
+  meson install -C build || return 1
+  return 0
+}
+
+try_cmake() {
+  have CMakeLists.txt || return 1
+  echo "== sistema: cmake"
+  command -v cmake >/dev/null || die "cmake nao instalado"
+  cmake -S . -B build -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_BUILD_TYPE=Release || return 1
+  cmake --build build -j"$JOBS" || return 1
+  cmake --install build || return 1
+  return 0
+}
+
+try_autotools() {
+  have configure || have Makefile.am || have configure.ac || return 1
+  echo "== sistema: autotools"
+  if ! have configure; then
+    have configure.ac && { command -v autoreconf >/dev/null || die "autoconf/automake faltando"; autoreconf -fi || return 1; }
+  fi
+  ./configure --prefix="$PREFIX" --libdir=lib || return 1
+  make -j"$JOBS" || return 1
+  make install || return 1
+  return 0
+}
+
+try_make() {
+  have Makefile || have Makefile.am || return 1
+  echo "== sistema: make"
+  command -v make >/dev/null || die "make nao instalado"
+  make -j"$JOBS" || return 1
+  make install PREFIX="$PREFIX" || make install || return 1
+  return 0
+}
+
+try_pip_whl() {
+  local w; w="$(find . -maxdepth 1 -name '*.whl' | head -1)" || w=""
+  [ -n "$w" ] || return 1
+  echo "== sistema: wheel"
+  PIP="$(command -v pip3 || command -v pip)"
+  "$PIP" install -f "$w" || return 1
+  return 0
+}
+
+try_npm() {
+  have package.json || return 1
+  command -v node >/dev/null || return 1
+  local binname
+  binname="$(python3 -c "
+import json,sys
+d=json.load(open('package.json'))
+b=d.get('bin')
+if isinstance(b,str): print(b)
+elif b: print(' '.join(b.keys()))
+" 2>/dev/null || true)"
+  [ -n "$binname" ] || return 1
+  echo "== sistema: npm -> $binname"
+  command -v npm >/dev/null || die "npm nao instalado"
+  npm install -g --prefix "$PREFIX" . || return 1
+  return 0
+}
+
+try_prebuilt() {
+  local exe
+  exe="$(find . -maxdepth 2 -type f -perm -u+x \
+    ! -name '*.sh' ! -name '*.py' ! -name '*.pl' ! -name '*.rb' \
+    ! -name '*.js' ! -name '*.mjs' ! -name '*.cjs' \
+    ! -name '*.so*' ! -name '*.dylib' \
+    ! -path '*/scripts/*' ! -path '*/tools/*' \
+    ! -path '*/tests/*' ! -path '*/test/*' ! -path '*/examples/*' \
+    ! -path '*/node_modules/*' ! -path '*/dist/*' ! -path '*/build/*' \
+    2>/dev/null | head -5)"
+  [ -n "$exe" ] || return 1
+  local real=""
+  for f in $exe; do
+    case "$(file -b "$f" 2>/dev/null)" in
+      ELF*|Mach-O*) real="$real $f" ;;
+    esac
+  done
+  [ -n "$real" ] || return 1
+  local n; n="$(echo $real | wc -w)"
+  echo "== sistema: binarios precompilados ($n)"
+  for f in $real; do
+    local base; base="$(basename "$f")"
+    cp -f "$f" "$PREFIX/bin/" || return 1
+    echo "   -> $PREFIX/bin/$base"
+  done
+  return 0
+}
+
+# register .desktop entries found in tree
+install_desktop_entries() {
+  [ "$UPDATE_MENU" = "0" ] && return 0
+  local dts; dts="$(find . -maxdepth 3 -name '*.desktop' -type f 2>/dev/null)"
+  [ -n "$dts" ] || return 0
+  local appdir="$PREFIX/share/applications"
+  mkdir -p "$appdir"
+  local icodir="$PREFIX/share/icons/hicolor/256x256/apps"
+  mkdir -p "$icodir"
+  for d in $dts; do
+    local base; base="$(basename "$d")"
+    cp -f "$d" "$appdir/$base" || continue
+    echo "   -> menu: $appdir/$base"
+    local exec_line exec_bin
+    exec_line="$(grep -m1 '^Exec=' "$d" | cut -d= -f2- | awk '{print $1}')"
+    exec_bin="$(basename "$exec_line" 2>/dev/null)"
+    if [ -n "$exec_bin" ] && [ -x "$PREFIX/bin/$exec_bin" ]; then
+      sed -i "s|^Exec=[^ ]*|Exec=$PREFIX/bin/$exec_bin|" "$appdir/$base"
+    fi
+    local icon; icon="$(grep -m1 '^Icon=' "$d" | cut -d= -f2- | tr -d ' ')"
+    case "$icon" in
+      /*) [ -f "$icon" ] && cp -f "$icon" "$icodir/$(basename "$icon")" && echo "   -> icone: $(basename "$icon")" ;;
+      ?*)
+        local found; found="$(find . -maxdepth 4 -type f \( -name "$icon.png" -o -name "$icon.svg" \) 2>/dev/null | head -1)"
+        [ -n "$found" ] && cp -f "$found" "$icodir/$(basename "$found")" && echo "   -> icone: $(basename "$found")"
+        ;;
+    esac
+  done
+  command -v update-desktop-database >/dev/null && update-desktop-database "$appdir" 2>/dev/null
+  command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t -f "$PREFIX/share/icons/hicolor" 2>/dev/null
+  command -v kbuildsycoca6 >/dev/null && (kbuildsycoca6 --noincremental >/dev/null 2>&1 &)
+  return 0
+}
+
+# ---- main ----
+for arg in "$@"; do
+  echo "=================================================="
+  echo "pacote: $arg"
+  srcdir_work="$(fetch_and_extract "$arg")"
+  srcdir="$(cat "$srcdir_work/.srcdir")"
+  cd "$srcdir"
+  echo "arvore: $srcdir"
+  mkdir -p "$PREFIX/bin"
+
+  ok=0
+  try_cargo && ok=1 || true
+  if [ "$ok" -eq 0 ]; then try_go && ok=1 || true; fi
+  if [ "$ok" -eq 0 ]; then try_python && ok=1 || true; fi
+  if [ "$ok" -eq 0 ]; then try_meson && ok=1 || true; fi
+  if [ "$ok" -eq 0 ]; then try_cmake && ok=1 || true; fi
+  if [ "$ok" -eq 0 ]; then try_autotools && ok=1 || true; fi
+  if [ "$ok" -eq 0 ]; then try_make && ok=1 || true; fi
+  if [ "$ok" -eq 0 ]; then try_pip_whl && ok=1 || true; fi
+  if [ "$ok" -eq 0 ]; then try_npm && ok=1 || true; fi
+  if [ "$ok" -eq 0 ]; then try_prebuilt && ok=1 || true; fi
+
+  if [ "$ok" -eq 0 ]; then
+    echo "== NAO RECONHECIDO. Estrutura encontrada:"
+    find . -maxdepth 2 | head -30
+    echo "== Parando. Rode manualmente em: $srcdir"
+    exit 1
+  fi
+
+  install_desktop_entries
+  cd "$srcdir"
+  echo "== OK: $arg"
+
+  [ "$CLEANUP" = "1" ] && rm -rf "$srcdir_work"
+done

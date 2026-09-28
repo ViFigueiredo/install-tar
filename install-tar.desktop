@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Name=Instalar Pacote (.tar.gz)
+Name[pt_BR]=Instalar Pacote (.tar.gz)
+GenericName=Instalar pacote comprimido
+Comment=Escolha um .tar.gz e instale automaticamente
+Exec=/home/viniciusfigueiredo/bin/install-tar-gui %F
+Icon=application-x-compressed-tar
+Terminal=false
+Categories=Utility;
+Keywords=pacote;install;tar.gz;instalar
+Actions=Settings;
+
+[Desktop Action Settings]
+Name=Configurações
+Name[pt_BR]=Configurações
+Exec=/home/viniciusfigueiredo/bin/install-tar-gui --settings
+Icon=configure
