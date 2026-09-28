@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# install-tar-gui: pick .tar.gz(s) via kdialog, install through install-tar, show progress in terminal.
-# Settings screen (gear button) edits ~/.config/install-tar/config.
+# install-tar-gui: menu principal (Instalar / Configurações / Sair).
+# Drag-and-drop de arquivos pula o menu e instala direto.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
@@ -9,21 +9,18 @@ ENGINE="$SELF_DIR/install-tar"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/install-tar"
 CONFIG_FILE="$CONFIG_DIR/config"
 
-# defaults
 PREFIX="${PREFIX:-$HOME/.local}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 2)}"
 CLEANUP="${CLEANUP:-1}"
 UPDATE_MENU="${UPDATE_MENU:-1}"
 DOWNLOAD_DIR="${DOWNLOAD_DIR:-$HOME/Downloads}"
 
-load_config() {
-  [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
-}
+load_config() { [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"; }
 
 save_config() {
   mkdir -p "$CONFIG_DIR"
   cat > "$CONFIG_FILE" <<EOF
-# install-tar settings (edit here or via the GUI)
+# install-tar settings
 PREFIX=$PREFIX
 JOBS=$JOBS
 CLEANUP=$CLEANUP
@@ -32,81 +29,78 @@ DOWNLOAD_DIR=$DOWNLOAD_DIR
 EOF
 }
 
-show_settings() {
-  load_config
-  # kdialog doesn't have a multi-field form; prompt each in sequence with current value.
-  local p_new
-  p_new="$(kdialog --title "Configurações — install-tar" \
-    --getexistingdirectory "$PREFIX" "Diretório de instalação (PREFIX)")"
-  [ -z "$p_new" ] && { echo "Configurações canceladas."; exit 0; }
-  PREFIX="$p_new"
-
-  local j_new
-  j_new="$(kdialog --title "Configurações — install-tar" \
-    --inputbox "Compilação paralela (JOBS):" "$JOBS")"
-  case "$j_new" in
-    ''|*[!0-9]*) echo "JOBS inválido: '$j_new' (número inteiro). Cancelado."; exit 1 ;;
-    *) JOBS="$j_new" ;;
-  esac
-
-  local c_new
-  if kdialog --title "Configurações — install-tar" \
-    --yesno "Limpar arquivos temporários de extração após instalar?"; then
-    CLEANUP=1; else CLEANUP=0
-  fi
-
-  local u_new
-  if kdialog --title "Configurações — install-tar" \
-    --yesno "Atualizar o menu de aplicativos automaticamente?"; then
-    UPDATE_MENU=1; else UPDATE_MENU=0
-  fi
-
-  local d_new
-  d_new="$(kdialog --title "Configurações — install-tar" \
-    --getexistingdirectory "$DOWNLOAD_DIR" "Pasta de downloads padrão (abrir aqui o seletor de arquivo):")"
-  [ -z "$d_new" ] || DOWNLOAD_DIR="$d_new"
-
-  save_config
-  kdialog --title "Configurações — install-tar" \
-    --msgbox "Configurações salvas em:\n$CONFIG_FILE" 2>/dev/null
-}
-
-# gear: settings entry as alternative action
-if [ "${1:-}" = "--settings" ]; then
-  show_settings
-  exit $?
-fi
-
-files=("$@")
-
-if [ "${#files[@]}" -eq 0 ]; then
+pick_files() {
   load_config
   mapfile -t picked < <(kdialog --title "Instalar pacote" \
     --getopenfilename "$DOWNLOAD_DIR" \
     "*.tar.gz *.tgz *.tar.xz *.txz *.tar.bz2 *.tbz2 *.tar *.zip | Pacotes comprimidos" \
     --multiple --separate-output 2>/dev/null)
-  [ "${#picked[@]}" -eq 0 ] && { echo "Cancelado."; exit 0; }
-  files=("${picked[@]}")
-fi
+  printf '%s\n' "${picked[@]}"
+}
 
-rc_total=0
-for f in "${files[@]}"; do
-  echo
-  echo "############### $f"
-  if ! "$ENGINE" "$f"; then
-    rc_total=1
-    echo
-    echo "!!! FALHOU: $f"
+install_list() {
+  local -a files=("$@")
+  [ "${#files[@]}" -eq 0 ] && return 0
+  local rc=0
+  for f in "${files[@]}"; do
+    echo; echo "############### $f"
+    if ! "$ENGINE" "$f"; then
+      rc=1; echo; echo "!!! FALHOU: $f"
+    fi
+  done
+  load_config
+  if [ "$rc" -eq 0 ]; then
+    notify-send -i package-x-generic "Instalação concluída" "${#files[@]} pacote(s) em $PREFIX/bin" 2>/dev/null || true
+    kdialog --title "Instalar pacote" --msgbox "Concluído: ${#files[@]} pacote(s) instalado(s) em $PREFIX/bin." 2>/dev/null
+  else
+    notify-send -i dialog-error "Instalação com falhas" "Veja o terminal." 2>/dev/null || true
+    kdialog --title "Instalar pacote" --error "Falha em um ou mais pacotes. Veja o terminal." 2>/dev/null
   fi
-done
+}
 
-echo
-load_config
-if [ "$rc_total" -eq 0 ]; then
-  notify-send -i package-x-generic "Instalação concluída" "${#files[@]} pacote(s) instalado(s) em $PREFIX/bin" 2>/dev/null || true
-  kdialog --title "Instalar pacote" --msgbox "Concluído: ${#files[@]} pacote(s) instalado(s) em $PREFIX/bin." 2>/dev/null
-else
-  notify-send -i dialog-error "Instalação com falhas" "Veja a saída no terminal." 2>/dev/null || true
-  kdialog --title "Instalar pacote" --error "Uma ou mais instalações falharam. Veja a saída no terminal." 2>/dev/null
+show_settings() {
+  load_config
+  local p_new
+  p_new="$(kdialog --title "Config - install-tar" --getexistingdirectory "$PREFIX" "PREFIX (diretório de instalação):")"
+  [ -z "$p_new" ] && return 0
+  PREFIX="$p_new"
+
+  local j_new
+  j_new="$(kdialog --title "Config - install-tar" --inputbox "JOBS (compilação paralela):" "$JOBS")"
+  case "$j_new" in ''|*[!0-9]*) return 0;; *) JOBS="$j_new";; esac
+
+  if kdialog --title "Config - install-tar" --yesno "Limpar temporários após instalar?"; then CLEANUP=1; else CLEANUP=0; fi
+  if kdialog --title "Config - install-tar" --yesno "Atualizar menu de aplicativos automaticamente?"; then UPDATE_MENU=1; else UPDATE_MENU=0; fi
+
+  local d_new
+  d_new="$(kdialog --title "Config - install-tar" --getexistingdirectory "$DOWNLOAD_DIR" "Pasta de downloads (abertura do seletor):")"
+  [ -n "$d_new" ] && DOWNLOAD_DIR="$d_new"
+
+  save_config
+  kdialog --title "Config - install-tar" --msgbox "Configurações salvas em:\n$CONFIG_FILE" 2>/dev/null
+}
+
+# --- entrada: se arquivos foram arrastados, instala direto ---
+if [ "$#" -gt 0 ] && [ "${1#--}" = "$1" ]; then
+  install_list "$@"
+  exit $?
 fi
-exit "$rc_total"
+
+# menu principal (loop até sair)
+load_config
+while true; do
+  choice="$(kdialog --title "install-tar" \
+    --default "Instalar" \
+    --menu "O que deseja fazer?" \
+    "Instalar" "Escolher pacote(s) .tar.gz e instalar" \
+    "Config"  "Alterar PREFIX, JOBS, limpeza, menu" \
+    "Sair"    "Fechar" 2>/dev/null)"
+  case "$choice" in
+    "Instalar")
+      picked="$(pick_files)"
+      [ -n "$picked" ] && install_list $picked
+      ;;
+    "Config") show_settings ;;
+    "Sair"|"") exit 0 ;;
+  esac
+done
